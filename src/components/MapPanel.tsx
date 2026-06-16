@@ -16,8 +16,9 @@ import { fromLonLat } from 'ol/proj';
 import { getCenter as getExtentCenter } from 'ol/extent';
 import { defaults as defaultControls, ScaleLine, Attribution } from 'ol/control';
 import { defaults as defaultInteractions } from 'ol/interaction';
-import { Eye, EyeOff, Trash2, MapPin, X, Loader2, Upload } from 'lucide-react';
+import { Eye, EyeOff, Trash2, MapPin, X, Loader2, Upload, Settings2 } from 'lucide-react';
 import type { FetchedLayer } from '../lib/geo';
+import { AVAILABLE_PROJECTIONS } from '../lib/geo';
 import 'ol/ol.css';
 
 interface MapPanelProps {
@@ -29,6 +30,7 @@ interface MapPanelProps {
   onClearAll: () => void;
   onAddLocal: (layer: FetchedLayer) => void;
   onError: (msg: string) => void;
+  onChangeProjection: (layerId: string, newProj: string) => void;
 }
 
 const COLORS = ['#14b8a6', '#0ea5e9', '#f59e0b', '#ef4444', '#a855f7', '#10b981', '#ec4899'];
@@ -64,14 +66,25 @@ function hexToRgba(hex: string, alpha: number): string {
  * 对点要素做"明显"样式: 较大半径 + 白色描边;
  * 线/面要素走"低透明填充 + 粗描边 + 白边" 样式,
  * 避免多层叠加时把底图全盖白。
+ * 同时渲染要素的 name 字段作为标签。
  */
 function makeStyle(color: string) {
+  // 标签样式: 白色背景 + 描边 + 黑字, 确保在各种底图上可读
+  const labelStyle = new Text({
+    font: 'bold 12px sans-serif',
+    fill: new Fill({ color: '#1f2937' }),
+    stroke: new Stroke({ color: '#ffffff', width: 3 }),
+    offsetY: -18,
+    textAlign: 'center',
+  });
+
   const pointStyle = new Style({
     image: new CircleStyle({
       radius: 9,
       fill: new Fill({ color }),
       stroke: new Stroke({ color: '#ffffff', width: 3 }),
     }),
+    text: labelStyle,
     zIndex: 10,
   });
 
@@ -85,23 +98,35 @@ function makeStyle(color: string) {
       fill: new Fill({ color }),
       stroke: new Stroke({ color: '#ffffff', width: 2.5 }),
     }),
+    text: labelStyle,
   });
 
   return (feature: FeatureLike) => {
     const g = feature.getGeometry();
     if (!g) return lineStyle;
     const t = g.getType();
-    if (t === 'Point' || t === 'MultiPoint') return pointStyle;
-    return lineStyle;
+    // 从要素属性中取 name 字段作为标签文本
+    const name = feature.get('name') || feature.get('NAME') || '';
+    const style = (t === 'Point' || t === 'MultiPoint') ? pointStyle.clone() : lineStyle.clone();
+    if (name) {
+      const text = style.getText();
+      if (text) text.setText(String(name));
+    } else {
+      style.setText(undefined as any); // 无 name 字段时不显示标签
+    }
+    return style;
   };
 }
 
-export function MapPanel({ open, layers, pending, onClose, onRemove, onClearAll, onAddLocal, onError }: MapPanelProps) {
+export function MapPanel({ open, layers, pending, onClose, onRemove, onClearAll, onAddLocal, onError, onChangeProjection }: MapPanelProps) {
   const mapEl = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<OlMap | null>(null);
   const layerByIdRef = useRef<Map<string, VectorLayer<VectorSource>>>(new globalThis.Map());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [visible, setVisible] = useState<Record<string, boolean>>({});
+  const [projMenuOpen, setProjMenuOpen] = useState<string | null>(null);
+  const [projMenuPos, setProjMenuPos] = useState<{ bottom: number; right: number }>({ bottom: 0, right: 0 });
+  const projBtnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   const handlePickFile = () => fileInputRef.current?.click();
 
@@ -180,11 +205,11 @@ export function MapPanel({ open, layers, pending, onClose, onRemove, onClearAll,
       const idx = layers.findIndex((x) => x.id === l.id);
       const color = COLORS[idx % COLORS.length];
       const source = new VectorSource();
-      // 数据原始投影 (4326 / 4526 / ...) 一次性转到 3857 (高德 Web Mercator),
-      // OL 内部通过 proj4 完成转换 (4526 已在 geo.ts 中注册)。
-      const dataProj = l.sourceProjection || 'EPSG:4326';
-      const features = new GeoJSON().readFeatures(l.geojson, {
-        dataProjection: dataProj,
+      // GeoJSON 已在 geo.ts 中被 proj4 直接转为 EPSG:3857,
+      // dataProjection === featureProjection = 3857, OL 不做任何变换 (彻底绕过轴序问题).
+      const geoForRender = l.normalizedGeojson || l.geojson;
+      const features = new GeoJSON().readFeatures(geoForRender, {
+        dataProjection: 'EPSG:3857',
         featureProjection: 'EPSG:3857',
       });
       source.addFeatures(features);
@@ -290,6 +315,7 @@ export function MapPanel({ open, layers, pending, onClose, onRemove, onClearAll,
   };
 
   return (
+    <>
     <div className="h-full flex flex-col bg-white border-l border-stone-200">
       <div className="flex items-center justify-between px-3 h-12 border-b border-stone-200 bg-stone-50">
         <div className="flex items-center gap-2 text-sm font-medium text-stone-800">
@@ -377,6 +403,30 @@ export function MapPanel({ open, layers, pending, onClose, onRemove, onClearAll,
                     {l.name}
                     <span className="text-stone-500 ml-1">({l.featureCount})</span>
                   </button>
+                  {/* 投影切换: 投影是探测出来的 或 用户点击了投影按钮 */}
+                  <div className="relative">
+                    <button
+                      ref={(el) => { projBtnRefs.current[l.id] = el; }}
+                      onClick={() => {
+                        if (projMenuOpen === l.id) {
+                          setProjMenuOpen(null);
+                        } else {
+                          const rect = projBtnRefs.current[l.id]?.getBoundingClientRect();
+                          if (rect) {
+                            // 下拉菜单在按钮上方显示 (列表往下拉，菜单往上弹)
+                            setProjMenuPos({ bottom: window.innerHeight - rect.top + 4, right: window.innerWidth - rect.right });
+                          }
+                          setProjMenuOpen(l.id);
+                        }
+                      }}
+                      className={`size-7 rounded text-stone-500 hover:text-stone-800 hover:bg-stone-200/60 flex items-center justify-center ${
+                        l.projectionInferred ? 'text-amber-600' : ''
+                      }`}
+                      title={`当前投影: ${l.sourceProjection}${l.projectionInferred ? ' (自动探测，点击可切换)' : ''}`}
+                    >
+                      <Settings2 className="size-3.5" />
+                    </button>
+                  </div>
                   <button
                     onClick={() => setVisible((v) => ({ ...v, [l.id]: !isOn }))}
                     className="size-7 rounded text-stone-500 hover:text-stone-800 hover:bg-stone-200/60 flex items-center justify-center"
@@ -398,8 +448,43 @@ export function MapPanel({ open, layers, pending, onClose, onRemove, onClearAll,
         )}
       </div>
     </div>
+
+    {/* 投影选择下拉菜单: fixed 定位, 逃离 overflow 裁剪 */}
+    {projMenuOpen && (() => {
+      const layer = layers.find((x) => x.id === projMenuOpen);
+      if (!layer) return null;
+      return (
+        <>
+          {/* 背景蒙层: 点击关闭 */}
+          <div className="fixed inset-0 z-[9998]" onClick={() => setProjMenuOpen(null)} />
+          <div
+            className="fixed z-[9999] w-72 bg-white border border-stone-200 rounded-lg shadow-xl py-1 max-h-80 overflow-y-auto"
+            style={{ bottom: projMenuPos.bottom, right: projMenuPos.right }}
+          >
+            <div className="px-3 py-1.5 text-[11px] text-stone-500 border-b border-stone-100 bg-stone-50/50">
+              切换坐标系
+              {layer.projectionInferred && <span className="text-amber-600"> （当前为自动探测）</span>}
+            </div>
+            {AVAILABLE_PROJECTIONS.map((p) => (
+              <button
+                key={p.code}
+                onClick={() => {
+                  onChangeProjection(layer.id, p.code);
+                  setProjMenuOpen(null);
+                }}
+                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-teal-50 transition ${
+                  layer.sourceProjection === p.code
+                    ? 'text-teal-700 font-medium bg-teal-50/50'
+                    : 'text-stone-700'
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </>
+      );
+    })()}
+    </>
   );
 }
-
-// 抑制 unused import 警告
-void Text;

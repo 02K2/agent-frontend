@@ -5,7 +5,7 @@ import { InputBar } from './InputBar';
 import { MessageBubble } from './MessageBubble';
 import { MapPanel } from './MapPanel';
 import { useChatStream } from '../hooks/useChatStream';
-import { fetchGeoJsonLayer, type FetchedLayer } from '../lib/geo';
+import { fetchGeoJsonLayer, rebuildLayerWithProjection, type FetchedLayer } from '../lib/geo';
 
 export function ChatWindow() {
   const { messages, isStreaming, send, abort, clear } = useChatStream();
@@ -70,6 +70,19 @@ export function ChatWindow() {
 
   const handleMapError = useCallback((msg: string) => {
     alert(msg);
+  }, []);
+
+  const handleChangeProjection = useCallback((layerId: string, newProj: string) => {
+    setLayers((ls) =>
+      ls.map((l) => {
+        if (l.id !== layerId) return l;
+        try {
+          return rebuildLayerWithProjection(l, newProj);
+        } catch {
+          return l;
+        }
+      }),
+    );
   }, []);
 
   const handleClear = useCallback(() => {
@@ -179,6 +192,7 @@ export function ChatWindow() {
               onClearAll={handleClearLayers}
               onAddLocal={handleAddLocalLayer}
               onError={handleMapError}
+              onChangeProjection={handleChangeProjection}
             />
           </div>
         )}
